@@ -25,8 +25,11 @@ import org.apache.hadoop.fs.Path
 import org.apache.parquet.example.data.simple.SimpleGroup
 import org.apache.parquet.schema.MessageTypeParser
 import org.apache.spark.sql.{CometTestBase, DataFrame, Row}
+import org.apache.spark.sql.catalyst.optimizer.EliminateSorts
 import org.apache.spark.sql.comet.CometHashAggregateExec
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+import org.apache.spark.sql.functions.sum
+import org.apache.spark.sql.internal.SQLConf
 
 import org.apache.comet.CometConf
 import org.apache.comet.CometSparkSessionExtensions.isSpark34Plus
@@ -36,15 +39,89 @@ import org.apache.comet.CometSparkSessionExtensions.isSpark34Plus
  */
 class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
 
+  test("Ensure traversed operators during finding first partial aggregation are all native") {
+    withTable("lineitem", "part") {
+      withSQLConf(
+        CometConf.COMET_ENABLED.key -> "true",
+        CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+        CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "true") {
+
+        sql(
+          "CREATE TABLE lineitem(l_extendedprice DOUBLE, l_quantity DOUBLE, l_partkey STRING) USING PARQUET")
+        sql("INSERT INTO TABLE lineitem VALUES (1.0, 1.0, '1')")
+
+        sql(
+          "CREATE TABLE part(p_partkey STRING, p_brand STRING, p_container STRING) USING PARQUET")
+        sql("INSERT INTO TABLE part VALUES ('1', 'Brand#23', 'MED BOX')")
+
+        val df = sql("""select
+            sum(l_extendedprice) / 7.0 as avg_yearly
+            from
+            lineitem,
+            part
+              where
+              p_partkey = l_partkey
+              and p_brand = 'Brand#23'
+          and p_container = 'MED BOX'
+          and l_quantity < (
+            select
+          0.2 * avg(l_quantity)
+          from
+          lineitem
+          where
+          l_partkey = p_partkey
+          )""")
+        checkAnswer(df, Row(null))
+      }
+    }
+  }
+
+  test("SUM decimal supports emit.first") {
+    withSQLConf(
+      SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> EliminateSorts.ruleName,
+      CometConf.COMET_ENABLED.key -> "true",
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "true") {
+      Seq(true, false).foreach { dictionaryEnabled =>
+        withTempDir { dir =>
+          val path = new Path(dir.toURI.toString, "test")
+          makeParquetFile(path, 10000, 10, dictionaryEnabled)
+          withParquetTable(path.toUri.toString, "tbl") {
+            checkSparkAnswer(sql("SELECT * FROM tbl").sort("_g1").groupBy("_g1").agg(sum("_8")))
+          }
+        }
+      }
+    }
+  }
+
   test("Fix NPE in partial decimal sum") {
     val table = "tbl"
     withTable(table) {
-      withSQLConf(CometConf.COMET_ENABLED.key -> "true") {
+      withSQLConf(
+        CometConf.COMET_ENABLED.key -> "true",
+        CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "false",
+        CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "false") {
         withTable(table) {
           sql(s"CREATE TABLE $table(col DECIMAL(5, 2)) USING PARQUET")
           sql(s"INSERT INTO TABLE $table VALUES (CAST(12345.01 AS DECIMAL(5, 2)))")
           val df = sql(s"SELECT SUM(col + 100000.01) FROM $table")
           checkAnswer(df, Row(null))
+        }
+      }
+    }
+  }
+
+  test("fix: Decimal Average should not enable native final aggregation") {
+    withSQLConf(CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true") {
+      Seq(true, false).foreach { dictionaryEnabled =>
+        withTempDir { dir =>
+          val path = new Path(dir.toURI.toString, "test")
+          makeParquetFile(path, 1000, 10, dictionaryEnabled)
+          withParquetTable(path.toUri.toString, "tbl") {
+            checkSparkAnswer("SELECT _g1, AVG(_7) FROM tbl GROUP BY _g1")
+            checkSparkAnswer("SELECT _g1, AVG(_8) FROM tbl GROUP BY _g1")
+            checkSparkAnswer("SELECT _g1, AVG(_9) FROM tbl GROUP BY _g1")
+          }
         }
       }
     }
@@ -119,14 +196,23 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
   }
 
   test("group-by on variable length types") {
-    Seq(true, false).foreach { dictionaryEnabled =>
-      withParquetTable((0 until 100).map(i => (i, (i % 10).toString)), "tbl", dictionaryEnabled) {
-        val n = 1
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, SUM(_1) FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, COUNT(_1) FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, MIN(_1) FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, MAX(_1) FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, AVG(_1) FROM tbl GROUP BY _2", n)
+    Seq(true, false).foreach { nativeShuffleEnabled =>
+      Seq(true, false).foreach { dictionaryEnabled =>
+        withSQLConf(
+          CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> nativeShuffleEnabled.toString,
+          CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "false") {
+          withParquetTable(
+            (0 until 100).map(i => (i, (i % 10).toString)),
+            "tbl",
+            dictionaryEnabled) {
+            val n = if (nativeShuffleEnabled) 2 else 1
+            checkSparkAnswerAndNumOfAggregates("SELECT _2, SUM(_1) FROM tbl GROUP BY _2", n)
+            checkSparkAnswerAndNumOfAggregates("SELECT _2, COUNT(_1) FROM tbl GROUP BY _2", n)
+            checkSparkAnswerAndNumOfAggregates("SELECT _2, MIN(_1) FROM tbl GROUP BY _2", n)
+            checkSparkAnswerAndNumOfAggregates("SELECT _2, MAX(_1) FROM tbl GROUP BY _2", n)
+            checkSparkAnswerAndNumOfAggregates("SELECT _2, AVG(_1) FROM tbl GROUP BY _2", n)
+          }
+        }
       }
     }
   }
@@ -292,30 +378,36 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
 
   test("SUM decimal with DF") {
     Seq(true, false).foreach { dictionaryEnabled =>
-      withTempDir { dir =>
-        val path = new Path(dir.toURI.toString, "test")
-        makeParquetFile(path, 1000, 20, dictionaryEnabled)
-        withParquetTable(path.toUri.toString, "tbl") {
-          val expectedNumOfCometAggregates = 1
+      Seq(true, false).foreach { nativeShuffleEnabled =>
+        withSQLConf(
+          CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> nativeShuffleEnabled.toString,
+          CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "false") {
+          withTempDir { dir =>
+            val path = new Path(dir.toURI.toString, "test")
+            makeParquetFile(path, 1000, 20, dictionaryEnabled)
+            withParquetTable(path.toUri.toString, "tbl") {
+              val expectedNumOfCometAggregates = if (nativeShuffleEnabled) 2 else 1
 
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT _g2, SUM(_7) FROM tbl GROUP BY _g2",
-            expectedNumOfCometAggregates)
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT _g3, SUM(_8) FROM tbl GROUP BY _g3",
-            expectedNumOfCometAggregates)
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT _g4, SUM(_9) FROM tbl GROUP BY _g4",
-            expectedNumOfCometAggregates)
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT SUM(_7) FROM tbl",
-            expectedNumOfCometAggregates)
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT SUM(_8) FROM tbl",
-            expectedNumOfCometAggregates)
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT SUM(_9) FROM tbl",
-            expectedNumOfCometAggregates)
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT _g2, SUM(_7) FROM tbl GROUP BY _g2",
+                expectedNumOfCometAggregates)
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT _g3, SUM(_8) FROM tbl GROUP BY _g3",
+                expectedNumOfCometAggregates)
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT _g4, SUM(_9) FROM tbl GROUP BY _g4",
+                expectedNumOfCometAggregates)
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT SUM(_7) FROM tbl",
+                expectedNumOfCometAggregates)
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT SUM(_8) FROM tbl",
+                expectedNumOfCometAggregates)
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT SUM(_9) FROM tbl",
+                expectedNumOfCometAggregates)
+            }
+          }
         }
       }
     }
@@ -346,8 +438,12 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
               (0 until numValues).map(i => (i, Random.nextInt() % numGroups)),
               "tbl",
               dictionaryEnabled) {
-              checkSparkAnswer(
-                "SELECT _2, SUM(_1), MIN(_1), MAX(_1), COUNT(_1), AVG(_1) FROM tbl GROUP BY _2")
+              withView("v") {
+                sql("CREATE TEMP VIEW v AS SELECT _1, _2 FROM tbl ORDER BY _1")
+                checkSparkAnswer(
+                  "SELECT _2, SUM(_1), SUM(DISTINCT _1), MIN(_1), MAX(_1), COUNT(_1)," +
+                    " COUNT(DISTINCT _1), AVG(_1), FIRST(_1), LAST(_1) FROM v GROUP BY _2")
+              }
             }
           }
         }
@@ -366,8 +462,15 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
               val path = new Path(dir.toURI.toString, "test.parquet")
               makeParquetFile(path, numValues, numGroups, dictionaryEnabled)
               withParquetTable(path.toUri.toString, "tbl") {
+                withView("v") {
+                  sql("CREATE TEMP VIEW v AS SELECT _g1, _g2, _3 FROM tbl ORDER BY _3")
+                  checkSparkAnswer("SELECT _g1, _g2, FIRST(_3) FROM v GROUP BY _g1, _g2")
+                  checkSparkAnswer("SELECT _g1, _g2, LAST(_3) FROM v GROUP BY _g1, _g2")
+                }
                 checkSparkAnswer("SELECT _g1, _g2, SUM(_3) FROM tbl GROUP BY _g1, _g2")
                 checkSparkAnswer("SELECT _g1, _g2, COUNT(_3) FROM tbl GROUP BY _g1, _g2")
+                checkSparkAnswer("SELECT _g1, _g2, SUM(DISTINCT _3) FROM tbl GROUP BY _g1, _g2")
+                checkSparkAnswer("SELECT _g1, _g2, COUNT(DISTINCT _3) FROM tbl GROUP BY _g1, _g2")
                 checkSparkAnswer("SELECT _g1, _g2, MIN(_3), MAX(_3) FROM tbl GROUP BY _g1, _g2")
                 checkSparkAnswer("SELECT _g1, _g2, AVG(_3) FROM tbl GROUP BY _g1, _g2")
               }
@@ -397,9 +500,19 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
               val path = new Path(dir.toURI.toString, "test.parquet")
               makeParquetFile(path, numValues, numGroups, dictionaryEnabled)
               withParquetTable(path.toUri.toString, "tbl") {
+                withView("v") {
+                  sql("CREATE TEMP VIEW v AS SELECT _g3, _g4, _3, _4 FROM tbl ORDER BY _3, _4")
+                  checkSparkAnswer(
+                    "SELECT _g3, _g4, FIRST(_3), FIRST(_4) FROM v GROUP BY _g3, _g4")
+                  checkSparkAnswer("SELECT _g3, _g4, LAST(_3), LAST(_4) FROM v GROUP BY _g3, _g4")
+                }
                 checkSparkAnswer("SELECT _g3, _g4, SUM(_3), SUM(_4) FROM tbl GROUP BY _g3, _g4")
                 checkSparkAnswer(
+                  "SELECT _g3, _g4, SUM(DISTINCT _3), SUM(DISTINCT _4) FROM tbl GROUP BY _g3, _g4")
+                checkSparkAnswer(
                   "SELECT _g3, _g4, COUNT(_3), COUNT(_4) FROM tbl GROUP BY _g3, _g4")
+                checkSparkAnswer(
+                  "SELECT _g3, _g4, COUNT(DISTINCT _3), COUNT(DISTINCT _4) FROM tbl GROUP BY _g3, _g4")
                 checkSparkAnswer(
                   "SELECT _g3, _g4, MIN(_3), MAX(_3), MIN(_4), MAX(_4) FROM tbl GROUP BY _g3, _g4")
                 checkSparkAnswer("SELECT _g3, _g4, AVG(_3), AVG(_4) FROM tbl GROUP BY _g3, _g4")
@@ -426,8 +539,17 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
                 // Test all combinations of different aggregation & group-by types
                 (1 to 4).foreach { col =>
                   (1 to 14).foreach { gCol =>
+                    withView("v") {
+                      sql(s"CREATE TEMP VIEW v AS SELECT _g$gCol, _$col FROM tbl ORDER BY _$col")
+                      checkSparkAnswer(s"SELECT _g$gCol, FIRST(_$col) FROM v GROUP BY _g$gCol")
+                      checkSparkAnswer(s"SELECT _g$gCol, LAST(_$col) FROM v GROUP BY _g$gCol")
+                    }
                     checkSparkAnswer(s"SELECT _g$gCol, SUM(_$col) FROM tbl GROUP BY _g$gCol")
+                    checkSparkAnswer(
+                      s"SELECT _g$gCol, SUM(DISTINCT _$col) FROM tbl GROUP BY _g$gCol")
                     checkSparkAnswer(s"SELECT _g$gCol, COUNT(_$col) FROM tbl GROUP BY _g$gCol")
+                    checkSparkAnswer(
+                      s"SELECT _g$gCol, COUNT(DISTINCT _$col) FROM tbl GROUP BY _g$gCol")
                     checkSparkAnswer(
                       s"SELECT _g$gCol, MIN(_$col), MAX(_$col) FROM tbl GROUP BY _g$gCol")
                     checkSparkAnswer(s"SELECT _g$gCol, AVG(_$col) FROM tbl GROUP BY _g$gCol")
@@ -442,98 +564,117 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
   }
 
   test("test final count") {
-    Seq(false, true).foreach { dictionaryEnabled =>
-      val n = 1
-      withParquetTable((0 until 5).map(i => (i, i % 2)), "tbl", dictionaryEnabled) {
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, COUNT(_1) FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("select count(_1) from tbl", n)
-        checkSparkAnswerAndNumOfAggregates(
-          "SELECT _2, COUNT(_1), SUM(_1) FROM tbl GROUP BY _2",
-          n)
-        checkSparkAnswerAndNumOfAggregates("SELECT COUNT(_1), COUNT(_2) FROM tbl", n)
+    withSQLConf(
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "false") {
+      Seq(false, true).foreach { dictionaryEnabled =>
+        withParquetTable((0 until 5).map(i => (i, i % 2)), "tbl", dictionaryEnabled) {
+          checkSparkAnswerAndNumOfAggregates("SELECT _2, COUNT(_1) FROM tbl GROUP BY _2", 2)
+          checkSparkAnswerAndNumOfAggregates("select count(_1) from tbl", 2)
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT _2, COUNT(_1), SUM(_1) FROM tbl GROUP BY _2",
+            2)
+          checkSparkAnswerAndNumOfAggregates("SELECT COUNT(_1), COUNT(_2) FROM tbl", 2)
+        }
       }
     }
   }
 
   test("test final min/max") {
-    Seq(true, false).foreach { dictionaryEnabled =>
-      withParquetTable((0 until 5).map(i => (i, i % 2)), "tbl", dictionaryEnabled) {
-        val n = 1
-        checkSparkAnswerAndNumOfAggregates(
-          "SELECT _2, MIN(_1), MAX(_1), COUNT(_1) FROM tbl GROUP BY _2",
-          n)
-        checkSparkAnswerAndNumOfAggregates("SELECT MIN(_1), MAX(_1), COUNT(_1) FROM tbl", 1)
-        checkSparkAnswerAndNumOfAggregates(
-          "SELECT _2, MIN(_1), MAX(_1), COUNT(_1), SUM(_1) FROM tbl GROUP BY _2",
-          n)
-        checkSparkAnswerAndNumOfAggregates(
-          "SELECT MIN(_1), MIN(_2), MAX(_1), MAX(_2), COUNT(_1), COUNT(_2) FROM tbl",
-          n)
+    withSQLConf(
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "false") {
+      Seq(true, false).foreach { dictionaryEnabled =>
+        withParquetTable((0 until 5).map(i => (i, i % 2)), "tbl", dictionaryEnabled) {
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT _2, MIN(_1), MAX(_1), COUNT(_1) FROM tbl GROUP BY _2",
+            2)
+          checkSparkAnswerAndNumOfAggregates("SELECT MIN(_1), MAX(_1), COUNT(_1) FROM tbl", 2)
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT _2, MIN(_1), MAX(_1), COUNT(_1), SUM(_1) FROM tbl GROUP BY _2",
+            2)
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT MIN(_1), MIN(_2), MAX(_1), MAX(_2), COUNT(_1), COUNT(_2) FROM tbl",
+            2)
+        }
       }
     }
   }
 
   test("test final min/max/count with result expressions") {
-    Seq(true, false).foreach { dictionaryEnabled =>
-      withParquetTable((0 until 5).map(i => (i, i % 2)), "tbl", dictionaryEnabled) {
-        val n = 1
-        checkSparkAnswerAndNumOfAggregates(
-          "SELECT _2, MIN(_1) + 2, COUNT(_1) FROM tbl GROUP BY _2",
-          n)
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, COUNT(_1) + 2 FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("SELECT _2 + 2, COUNT(_1) FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, MIN(_1) + MAX(_1) FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, MIN(_1) + _2 FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates(
-          "SELECT _2 + 2, MIN(_1), MAX(_1), COUNT(_1) FROM tbl GROUP BY _2",
-          n)
-        checkSparkAnswerAndNumOfAggregates(
-          "SELECT _2, MIN(_1), MAX(_1) + 2, COUNT(_1) FROM tbl GROUP BY _2",
-          n)
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, SUM(_1) + 2 FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("SELECT _2 + 2, SUM(_1) FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, SUM(_1 + 1) FROM tbl GROUP BY _2", n)
+    withSQLConf(
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "false") {
+      Seq(true, false).foreach { dictionaryEnabled =>
+        withParquetTable((0 until 5).map(i => (i, i % 2)), "tbl", dictionaryEnabled) {
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT _2, MIN(_1) + 2, COUNT(_1) FROM tbl GROUP BY _2",
+            2)
+          checkSparkAnswerAndNumOfAggregates("SELECT _2, COUNT(_1) + 2 FROM tbl GROUP BY _2", 2)
+          checkSparkAnswerAndNumOfAggregates("SELECT _2 + 2, COUNT(_1) FROM tbl GROUP BY _2", 2)
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT _2, MIN(_1) + MAX(_1) FROM tbl GROUP BY _2",
+            2)
+          checkSparkAnswerAndNumOfAggregates("SELECT _2, MIN(_1) + _2 FROM tbl GROUP BY _2", 2)
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT _2 + 2, MIN(_1), MAX(_1), COUNT(_1) FROM tbl GROUP BY _2",
+            2)
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT _2, MIN(_1), MAX(_1) + 2, COUNT(_1) FROM tbl GROUP BY _2",
+            2)
+          checkSparkAnswerAndNumOfAggregates("SELECT _2, SUM(_1) + 2 FROM tbl GROUP BY _2", 2)
+          checkSparkAnswerAndNumOfAggregates("SELECT _2 + 2, SUM(_1) FROM tbl GROUP BY _2", 2)
+          checkSparkAnswerAndNumOfAggregates("SELECT _2, SUM(_1 + 1) FROM tbl GROUP BY _2", 2)
 
-        // result expression is unsupported by Comet, so only partial aggregation should be used
-        val df = sql(
-          "SELECT _2, MIN(_1) + java_method('java.lang.Math', 'random') " +
-            "FROM tbl GROUP BY _2")
-        assert(getNumCometHashAggregate(df) == 1)
+          // result expression is unsupported by Comet, so only partial aggregation should be used
+          val df = sql(
+            "SELECT _2, MIN(_1) + java_method('java.lang.Math', 'random') " +
+              "FROM tbl GROUP BY _2")
+          assert(getNumCometHashAggregate(df) == 1)
+        }
       }
     }
   }
 
   test("test final sum") {
-    Seq(false, true).foreach { dictionaryEnabled =>
-      val n = 1
-      withParquetTable((0L until 5L).map(i => (i, i % 2)), "tbl", dictionaryEnabled) {
-        checkSparkAnswerAndNumOfAggregates("SELECT _2, SUM(_1), MIN(_1) FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("SELECT SUM(_1) FROM tbl", n)
-        checkSparkAnswerAndNumOfAggregates(
-          "SELECT _2, MIN(_1), MAX(_1), COUNT(_1), SUM(_1), AVG(_1) FROM tbl GROUP BY _2",
-          n)
-        checkSparkAnswerAndNumOfAggregates(
-          "SELECT MIN(_1), MIN(_2), MAX(_1), MAX(_2), COUNT(_1), COUNT(_2), SUM(_1), SUM(_2) FROM tbl",
-          n)
+    withSQLConf(
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "false") {
+      Seq(false, true).foreach { dictionaryEnabled =>
+        withParquetTable((0L until 5L).map(i => (i, i % 2)), "tbl", dictionaryEnabled) {
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT _2, SUM(_1), MIN(_1) FROM tbl GROUP BY _2",
+            2)
+          checkSparkAnswerAndNumOfAggregates("SELECT SUM(_1) FROM tbl", 2)
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT _2, MIN(_1), MAX(_1), COUNT(_1), SUM(_1), AVG(_1) FROM tbl GROUP BY _2",
+            2)
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT MIN(_1), MIN(_2), MAX(_1), MAX(_2), COUNT(_1), COUNT(_2), SUM(_1), SUM(_2) FROM tbl",
+            2)
+        }
       }
     }
   }
 
   test("test final avg") {
-    Seq(true, false).foreach { dictionaryEnabled =>
-      withParquetTable(
-        (0 until 5).map(i => (i.toDouble, i.toDouble % 2)),
-        "tbl",
-        dictionaryEnabled) {
-        val n = 1
-        checkSparkAnswerAndNumOfAggregates("SELECT _2 , AVG(_1) FROM tbl GROUP BY _2", n)
-        checkSparkAnswerAndNumOfAggregates("SELECT AVG(_1) FROM tbl", n)
-        checkSparkAnswerAndNumOfAggregates(
-          "SELECT _2, MIN(_1), MAX(_1), COUNT(_1), SUM(_1), AVG(_1) FROM tbl GROUP BY _2",
-          n)
-        checkSparkAnswerAndNumOfAggregates(
-          "SELECT MIN(_1), MIN(_2), MAX(_1), MAX(_2), COUNT(_1), COUNT(_2), SUM(_1), SUM(_2), AVG(_1), AVG(_2) FROM tbl",
-          n)
+    withSQLConf(
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "false") {
+      Seq(true, false).foreach { dictionaryEnabled =>
+        withParquetTable(
+          (0 until 5).map(i => (i.toDouble, i.toDouble % 2)),
+          "tbl",
+          dictionaryEnabled) {
+          checkSparkAnswerAndNumOfAggregates("SELECT _2 , AVG(_1) FROM tbl GROUP BY _2", 2)
+          checkSparkAnswerAndNumOfAggregates("SELECT AVG(_1) FROM tbl", 2)
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT _2, MIN(_1), MAX(_1), COUNT(_1), SUM(_1), AVG(_1) FROM tbl GROUP BY _2",
+            2)
+          checkSparkAnswerAndNumOfAggregates(
+            "SELECT MIN(_1), MIN(_2), MAX(_1), MAX(_2), COUNT(_1), COUNT(_2), SUM(_1), SUM(_2), AVG(_1), AVG(_2) FROM tbl",
+            2)
+        }
       }
     }
   }
@@ -542,31 +683,34 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     // TODO: enable decimal average for Spark 3.2 & 3.3
     assume(isSpark34Plus)
 
-    Seq(true, false).foreach { dictionaryEnabled =>
-      withSQLConf("parquet.enable.dictionary" -> dictionaryEnabled.toString) {
-        val table = "t1"
-        withTable(table) {
-          sql(s"create table $table(a decimal(38, 37), b INT) using parquet")
-          sql(s"insert into $table values(-0.0000000000000000000000000000000000002, 1)")
-          sql(s"insert into $table values(-0.0000000000000000000000000000000000002, 1)")
-          sql(s"insert into $table values(-0.0000000000000000000000000000000000004, 2)")
-          sql(s"insert into $table values(-0.0000000000000000000000000000000000004, 2)")
-          sql(s"insert into $table values(-0.00000000000000000000000000000000000002, 3)")
-          sql(s"insert into $table values(-0.00000000000000000000000000000000000002, 3)")
-          sql(s"insert into $table values(-0.00000000000000000000000000000000000004, 4)")
-          sql(s"insert into $table values(-0.00000000000000000000000000000000000004, 4)")
-          sql(s"insert into $table values(0.13344406545919155429936259114971302408, 5)")
-          sql(s"insert into $table values(0.13344406545919155429936259114971302408, 5)")
+    withSQLConf(
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "false") {
+      Seq(true, false).foreach { dictionaryEnabled =>
+        withSQLConf("parquet.enable.dictionary" -> dictionaryEnabled.toString) {
+          val table = "t1"
+          withTable(table) {
+            sql(s"create table $table(a decimal(38, 37), b INT) using parquet")
+            sql(s"insert into $table values(-0.0000000000000000000000000000000000002, 1)")
+            sql(s"insert into $table values(-0.0000000000000000000000000000000000002, 1)")
+            sql(s"insert into $table values(-0.0000000000000000000000000000000000004, 2)")
+            sql(s"insert into $table values(-0.0000000000000000000000000000000000004, 2)")
+            sql(s"insert into $table values(-0.00000000000000000000000000000000000002, 3)")
+            sql(s"insert into $table values(-0.00000000000000000000000000000000000002, 3)")
+            sql(s"insert into $table values(-0.00000000000000000000000000000000000004, 4)")
+            sql(s"insert into $table values(-0.00000000000000000000000000000000000004, 4)")
+            sql(s"insert into $table values(0.13344406545919155429936259114971302408, 5)")
+            sql(s"insert into $table values(0.13344406545919155429936259114971302408, 5)")
 
-          val n = 1
-          checkSparkAnswerAndNumOfAggregates("SELECT b , AVG(a) FROM t1 GROUP BY b", n)
-          checkSparkAnswerAndNumOfAggregates("SELECT AVG(a) FROM t1", n)
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT b, MIN(a), MAX(a), COUNT(a), SUM(a), AVG(a) FROM t1 GROUP BY b",
-            n)
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT MIN(a), MAX(a), COUNT(a), SUM(a), AVG(a) FROM t1",
-            n)
+            checkSparkAnswerAndNumOfAggregates("SELECT b , AVG(a) FROM t1 GROUP BY b", 2)
+            checkSparkAnswerAndNumOfAggregates("SELECT AVG(a) FROM t1", 2)
+            checkSparkAnswerAndNumOfAggregates(
+              "SELECT b, MIN(a), MAX(a), COUNT(a), SUM(a), AVG(a) FROM t1 GROUP BY b",
+              2)
+            checkSparkAnswerAndNumOfAggregates(
+              "SELECT MIN(a), MAX(a), COUNT(a), SUM(a), AVG(a) FROM t1",
+              2)
+          }
         }
       }
     }
@@ -584,54 +728,164 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
   }
 
   test("avg null handling") {
-    val table = "t1"
-    withTable(table) {
-      sql(s"create table $table(a double, b double) using parquet")
-      sql(s"insert into $table values(1, 1.0)")
-      sql(s"insert into $table values(null, null)")
-      sql(s"insert into $table values(1, 2.0)")
-      sql(s"insert into $table values(null, null)")
-      sql(s"insert into $table values(2, null)")
-      sql(s"insert into $table values(2, null)")
+    withSQLConf(
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "false") {
+      val table = "t1"
+      withTable(table) {
+        sql(s"create table $table(a double, b double) using parquet")
+        sql(s"insert into $table values(1, 1.0)")
+        sql(s"insert into $table values(null, null)")
+        sql(s"insert into $table values(1, 2.0)")
+        sql(s"insert into $table values(null, null)")
+        sql(s"insert into $table values(2, null)")
+        sql(s"insert into $table values(2, null)")
 
-      val query = sql(s"select a, AVG(b) from $table GROUP BY a")
-      checkSparkAnswer(query)
+        val query = sql(s"select a, AVG(b) from $table GROUP BY a")
+        checkSparkAnswer(query)
+      }
     }
   }
 
   test("Decimal Avg with DF") {
     Seq(true, false).foreach { dictionaryEnabled =>
-      withTempDir { dir =>
-        val path = new Path(dir.toURI.toString, "test")
-        makeParquetFile(path, 1000, 20, dictionaryEnabled)
-        withParquetTable(path.toUri.toString, "tbl") {
-          val expectedNumOfCometAggregates = 1
+      Seq(true, false).foreach { nativeShuffleEnabled =>
+        withSQLConf(
+          CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> nativeShuffleEnabled.toString,
+          CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "false") {
+          withTempDir { dir =>
+            val path = new Path(dir.toURI.toString, "test")
+            makeParquetFile(path, 1000, 20, dictionaryEnabled)
+            withParquetTable(path.toUri.toString, "tbl") {
+              val expectedNumOfCometAggregates = if (nativeShuffleEnabled) 2 else 1
 
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT _g2, AVG(_7) FROM tbl GROUP BY _g2",
-            expectedNumOfCometAggregates)
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT _g2, AVG(_7) FROM tbl GROUP BY _g2",
+                expectedNumOfCometAggregates)
 
-          checkSparkAnswerWithTol("SELECT _g3, AVG(_8) FROM tbl GROUP BY _g3")
-          assert(
-            getNumCometHashAggregate(
-              sql("SELECT _g3, AVG(_8) FROM tbl GROUP BY _g3")) == expectedNumOfCometAggregates)
+              checkSparkAnswerWithTol("SELECT _g3, AVG(_8) FROM tbl GROUP BY _g3")
+              assert(getNumCometHashAggregate(
+                sql("SELECT _g3, AVG(_8) FROM tbl GROUP BY _g3")) == expectedNumOfCometAggregates)
 
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT _g4, AVG(_9) FROM tbl GROUP BY _g4",
-            expectedNumOfCometAggregates)
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT _g4, AVG(_9) FROM tbl GROUP BY _g4",
+                expectedNumOfCometAggregates)
 
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT AVG(_7) FROM tbl",
-            expectedNumOfCometAggregates)
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT AVG(_7) FROM tbl",
+                expectedNumOfCometAggregates)
 
-          checkSparkAnswerWithTol("SELECT AVG(_8) FROM tbl")
-          assert(
-            getNumCometHashAggregate(
-              sql("SELECT AVG(_8) FROM tbl")) == expectedNumOfCometAggregates)
+              checkSparkAnswerWithTol("SELECT AVG(_8) FROM tbl")
+              assert(getNumCometHashAggregate(
+                sql("SELECT AVG(_8) FROM tbl")) == expectedNumOfCometAggregates)
 
-          checkSparkAnswerAndNumOfAggregates(
-            "SELECT AVG(_9) FROM tbl",
-            expectedNumOfCometAggregates)
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT AVG(_9) FROM tbl",
+                expectedNumOfCometAggregates)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("distinct") {
+    withSQLConf(CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true") {
+      Seq(true, false).foreach { cometColumnShuffleEnabled =>
+        withSQLConf(
+          CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> cometColumnShuffleEnabled.toString) {
+          Seq(true, false).foreach { dictionary =>
+            withSQLConf("parquet.enable.dictionary" -> dictionary.toString) {
+              val table = "test"
+              withTable(table) {
+                sql(s"create table $table(col1 int, col2 int, col3 int) using parquet")
+                sql(
+                  s"insert into $table values(1, 1, 1), (1, 1, 1), (1, 3, 1), (1, 4, 2), (5, 3, 2)")
+
+                var expectedNumOfCometAggregates = 2
+
+                checkSparkAnswerAndNumOfAggregates(
+                  s"SELECT DISTINCT(col2) FROM $table",
+                  expectedNumOfCometAggregates)
+
+                expectedNumOfCometAggregates = 4
+
+                checkSparkAnswerAndNumOfAggregates(
+                  s"SELECT COUNT(distinct col2) FROM $table",
+                  expectedNumOfCometAggregates)
+
+                checkSparkAnswerAndNumOfAggregates(
+                  s"SELECT COUNT(distinct col2), col1 FROM $table group by col1",
+                  expectedNumOfCometAggregates)
+
+                checkSparkAnswerAndNumOfAggregates(
+                  s"SELECT SUM(distinct col2) FROM $table",
+                  expectedNumOfCometAggregates)
+
+                checkSparkAnswerAndNumOfAggregates(
+                  s"SELECT SUM(distinct col2), col1 FROM $table group by col1",
+                  expectedNumOfCometAggregates)
+
+                checkSparkAnswerAndNumOfAggregates(
+                  "SELECT COUNT(distinct col2), SUM(distinct col2), col1, COUNT(distinct col2)," +
+                    s" SUM(distinct col2) FROM $table group by col1",
+                  expectedNumOfCometAggregates)
+
+                expectedNumOfCometAggregates = 1
+                checkSparkAnswerAndNumOfAggregates(
+                  "SELECT COUNT(col2), MIN(col2), COUNT(DISTINCT col2), SUM(col2)," +
+                    s" SUM(DISTINCT col2), COUNT(DISTINCT col2), col1 FROM $table group by col1",
+                  expectedNumOfCometAggregates)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("first/last") {
+    withSQLConf(
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "true") {
+      Seq(true, false).foreach { dictionary =>
+        withSQLConf("parquet.enable.dictionary" -> dictionary.toString) {
+          val table = "test"
+          withTable(table) {
+            sql(s"create table $table(col1 int, col2 int, col3 int) using parquet")
+            sql(
+              s"insert into $table values(4, 1, 1), (4, 1, 1), (3, 3, 1)," +
+                " (2, 4, 2), (1, 3, 2), (null, 1, 1)")
+            withView("t") {
+              sql("CREATE VIEW t AS SELECT col1, col3 FROM test ORDER BY col1")
+
+              var expectedNumOfCometAggregates = 2
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT FIRST(col1), LAST(col1) FROM t",
+                expectedNumOfCometAggregates)
+
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT FIRST(col1), LAST(col1), MIN(col1), COUNT(col1) FROM t",
+                expectedNumOfCometAggregates)
+
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT FIRST(col1), LAST(col1), col3 FROM t GROUP BY col3",
+                expectedNumOfCometAggregates)
+
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT FIRST(col1), LAST(col1), MIN(col1), COUNT(col1), col3 FROM t GROUP BY col3",
+                expectedNumOfCometAggregates)
+
+              expectedNumOfCometAggregates = 0
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT FIRST(col1, true), LAST(col1) FROM t",
+                expectedNumOfCometAggregates)
+
+              checkSparkAnswerAndNumOfAggregates(
+                "SELECT FIRST(col1), LAST(col1, true), col3 FROM t GROUP BY col3",
+                expectedNumOfCometAggregates)
+            }
+          }
         }
       }
     }

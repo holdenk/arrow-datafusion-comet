@@ -23,23 +23,23 @@ import scala.collection.JavaConverters._
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Average, Count, Final, Max, Min, Partial, Sum}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Average, Count, Final, First, Last, Max, Min, Partial, Sum}
 import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
 import org.apache.spark.sql.catalyst.optimizer.NormalizeNaNAndZero
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, SinglePartition}
 import org.apache.spark.sql.catalyst.util.CharVarcharCodegenUtils
-import org.apache.spark.sql.comet.{CometHashAggregateExec, CometSinkPlaceHolder, DecimalPrecision}
+import org.apache.spark.sql.comet.{CometHashAggregateExec, CometPlan, CometSinkPlaceHolder, DecimalPrecision}
 import org.apache.spark.sql.execution
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.aggregate.HashAggregateExec
-import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
+import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
 import org.apache.comet.CometSparkSessionExtensions.{isCometOperatorEnabled, isCometScan, isSpark32, isSpark34Plus}
 import org.apache.comet.serde.ExprOuterClass.{AggExpr, DataType => ProtoDataType, Expr, ScalarFunc}
-import org.apache.comet.serde.ExprOuterClass.DataType.{DataTypeInfo, DecimalInfo, ListInfo, StructInfo}
+import org.apache.comet.serde.ExprOuterClass.DataType.{DataTypeInfo, DecimalInfo, ListInfo, MapInfo, StructInfo}
 import org.apache.comet.serde.OperatorOuterClass.{AggregateMode => CometAggregateMode, Operator}
 import org.apache.comet.shims.ShimQueryPlanSerde
 
@@ -85,7 +85,8 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde {
       case _: DateType => 12
       case _: NullType => 13
       case _: ArrayType => 14
-      case _: StructType => 15
+      case _: MapType => 15
+      case _: StructType => 16
       case dt =>
         emitWarning(s"Cannot serialize Spark data type: $dt")
         return None
@@ -117,6 +118,26 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde {
         list.setContainsNull(a.containsNull)
 
         info.setList(list)
+        builder.setTypeInfo(info.build()).build()
+
+      case m: MapType =>
+        val keyType = serializeDataType(m.keyType)
+        if (keyType.isEmpty) {
+          return None
+        }
+
+        val valueType = serializeDataType(m.valueType)
+        if (valueType.isEmpty) {
+          return None
+        }
+
+        val info = DataTypeInfo.newBuilder()
+        val map = MapInfo.newBuilder()
+        map.setKeyType(keyType.get)
+        map.setValueType(valueType.get)
+        map.setValueContainsNull(m.valueContainsNull)
+
+        info.setMap(map)
         builder.setTypeInfo(info.build()).build()
 
       case s: StructType =>
@@ -262,6 +283,42 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde {
             ExprOuterClass.AggExpr
               .newBuilder()
               .setMax(maxBuilder)
+              .build())
+        } else {
+          None
+        }
+      case first @ First(child, ignoreNulls)
+          if !ignoreNulls => // DataFusion doesn't support ignoreNulls true
+        val childExpr = exprToProto(child, inputs)
+        val dataType = serializeDataType(first.dataType)
+
+        if (childExpr.isDefined && dataType.isDefined) {
+          val firstBuilder = ExprOuterClass.First.newBuilder()
+          firstBuilder.setChild(childExpr.get)
+          firstBuilder.setDatatype(dataType.get)
+
+          Some(
+            ExprOuterClass.AggExpr
+              .newBuilder()
+              .setFirst(firstBuilder)
+              .build())
+        } else {
+          None
+        }
+      case last @ Last(child, ignoreNulls)
+          if !ignoreNulls => // DataFusion doesn't support ignoreNulls true
+        val childExpr = exprToProto(child, inputs)
+        val dataType = serializeDataType(last.dataType)
+
+        if (childExpr.isDefined && dataType.isDefined) {
+          val lastBuilder = ExprOuterClass.Last.newBuilder()
+          lastBuilder.setChild(childExpr.get)
+          lastBuilder.setDatatype(dataType.get)
+
+          Some(
+            ExprOuterClass.AggExpr
+              .newBuilder()
+              .setLast(lastBuilder)
               .build())
         } else {
           None
@@ -1356,6 +1413,15 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde {
       case In(value, list) =>
         in(value, list, inputs, false)
 
+      case InSet(value, hset) =>
+        val valueDataType = value.dataType
+        val list = hset.map { setVal =>
+          Literal(setVal, valueDataType)
+        }.toSeq
+        // Change `InSet` to `In` expression
+        // We do Spark `InSet` optimization in native (DataFusion) side.
+        in(value, list, inputs, false)
+
       case Not(In(value, list)) =>
         in(value, list, inputs, true)
 
@@ -1632,60 +1698,97 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde {
             _,
             groupingExpressions,
             aggregateExpressions,
-            _,
+            aggregateAttributes,
             _,
             resultExpressions,
             child) if isCometOperatorEnabled(op.conf, "aggregate") =>
-        val modes = aggregateExpressions.map(_.mode).distinct
-
-        if (modes.size != 1) {
-          // This shouldn't happen as all aggregation expressions should share the same mode.
-          // Fallback to Spark nevertheless here.
+        if (groupingExpressions.isEmpty && aggregateExpressions.isEmpty) {
           return None
         }
 
-        val mode = modes.head match {
-          case Partial => CometAggregateMode.Partial
-          case Final => CometAggregateMode.Final
-          case _ => return None
-        }
-
-        val output = mode match {
-          case CometAggregateMode.Partial => child.output
-          case CometAggregateMode.Final =>
-            // Assuming `Final` always follows `Partial` aggregation, this find the first
-            // `Partial` aggregation and get the input attributes from it.
-            child.collectFirst { case CometHashAggregateExec(_, _, _, _, input, Partial, _) =>
-              input
-            } match {
-              case Some(input) => input
-              case _ => return None
-            }
-          case _ => return None
-        }
-
-        val aggExprs = aggregateExpressions.map(aggExprToProto(_, output))
         val groupingExprs = groupingExpressions.map(exprToProto(_, child.output))
 
-        if (childOp.nonEmpty && groupingExprs.forall(_.isDefined) &&
-          aggExprs.forall(_.isDefined)) {
+        // In some of the cases, the aggregateExpressions could be empty.
+        // For example, if the aggregate functions only have group by or if the aggregate
+        // functions only have distinct aggregate functions:
+        //
+        // SELECT COUNT(distinct col2), col1 FROM test group by col1
+        //  +- HashAggregate (keys =[col1# 6], functions =[count (distinct col2#7)] )
+        //    +- Exchange hashpartitioning (col1#6, 10), ENSURE_REQUIREMENTS, [plan_id = 36]
+        //      +- HashAggregate (keys =[col1#6], functions =[partial_count (distinct col2#7)] )
+        //        +- HashAggregate (keys =[col1#6, col2#7], functions =[] )
+        //          +- Exchange hashpartitioning (col1#6, col2#7, 10), ENSURE_REQUIREMENTS, ...
+        //            +- HashAggregate (keys =[col1#6, col2#7], functions =[] )
+        //              +- FileScan parquet spark_catalog.default.test[col1#6, col2#7] ......
+        // If the aggregateExpressions is empty, we only want to build groupingExpressions,
+        // and skip processing of aggregateExpressions.
+        if (aggregateExpressions.isEmpty) {
           val hashAggBuilder = OperatorOuterClass.HashAggregate.newBuilder()
           hashAggBuilder.addAllGroupingExprs(groupingExprs.map(_.get).asJava)
-          hashAggBuilder.addAllAggExprs(aggExprs.map(_.get).asJava)
-          if (mode == CometAggregateMode.Final) {
-            val attributes = groupingExpressions.map(_.toAttribute) ++
-              aggregateExpressions.map(_.resultAttribute)
-            val resultExprs = resultExpressions.map(exprToProto(_, attributes))
-            if (resultExprs.exists(_.isEmpty)) {
-              emitWarning(s"Unsupported result expressions found in: ${resultExpressions}")
-              return None
-            }
-            hashAggBuilder.addAllResultExprs(resultExprs.map(_.get).asJava)
-          }
-          hashAggBuilder.setModeValue(mode.getNumber)
           Some(result.setHashAgg(hashAggBuilder).build())
         } else {
-          None
+          val modes = aggregateExpressions.map(_.mode).distinct
+
+          if (modes.size != 1) {
+            // This shouldn't happen as all aggregation expressions should share the same mode.
+            // Fallback to Spark nevertheless here.
+            return None
+          }
+
+          val mode = modes.head match {
+            case Partial => CometAggregateMode.Partial
+            case Final => CometAggregateMode.Final
+            case _ => return None
+          }
+
+          val output = mode match {
+            case CometAggregateMode.Partial => child.output
+            case CometAggregateMode.Final =>
+              // Assuming `Final` always follows `Partial` aggregation, this find the first
+              // `Partial` aggregation and get the input attributes from it.
+              // During finding partial aggregation, we must ensure all traversed op are
+              // native operators. If not, we should fallback to Spark.
+              var seenNonNativeOp = false
+              var partialAggInput: Option[Seq[Attribute]] = None
+              child.transformDown {
+                case op if !op.isInstanceOf[CometPlan] =>
+                  seenNonNativeOp = true
+                  op
+                case op @ CometHashAggregateExec(_, _, _, _, input, Some(Partial), _, _) =>
+                  if (!seenNonNativeOp && partialAggInput.isEmpty) {
+                    partialAggInput = Some(input)
+                  }
+                  op
+              }
+
+              if (partialAggInput.isDefined) {
+                partialAggInput.get
+              } else {
+                return None
+              }
+            case _ => return None
+          }
+
+          val aggExprs = aggregateExpressions.map(aggExprToProto(_, output))
+          if (childOp.nonEmpty && groupingExprs.forall(_.isDefined) &&
+            aggExprs.forall(_.isDefined)) {
+            val hashAggBuilder = OperatorOuterClass.HashAggregate.newBuilder()
+            hashAggBuilder.addAllGroupingExprs(groupingExprs.map(_.get).asJava)
+            hashAggBuilder.addAllAggExprs(aggExprs.map(_.get).asJava)
+            if (mode == CometAggregateMode.Final) {
+              val attributes = groupingExpressions.map(_.toAttribute) ++ aggregateAttributes
+              val resultExprs = resultExpressions.map(exprToProto(_, attributes))
+              if (resultExprs.exists(_.isEmpty)) {
+                emitWarning(s"Unsupported result expressions found in: ${resultExpressions}")
+                return None
+              }
+              hashAggBuilder.addAllResultExprs(resultExprs.map(_.get).asJava)
+            }
+            hashAggBuilder.setModeValue(mode.getNumber)
+            Some(result.setHashAgg(hashAggBuilder).build())
+          } else {
+            None
+          }
         }
 
       case op if isCometSink(op) =>
@@ -1698,6 +1801,10 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde {
 
         if (scanTypes.length == op.output.length) {
           scanBuilder.addAllFields(scanTypes.asJava)
+
+          // Sink operators don't have children
+          result.clearChildren()
+
           Some(result.setScan(scanBuilder).build())
         } else {
           // There are unsupported scan type
@@ -1731,6 +1838,7 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde {
       case _: UnionExec => true
       case _: ShuffleExchangeExec => true
       case _: TakeOrderedAndProjectExec => true
+      case _: BroadcastExchangeExec => true
       case _ => false
     }
   }
@@ -1758,8 +1866,17 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde {
       case StructType(fields) =>
         fields.forall(f => supportedDataType(f.dataType))
       case ArrayType(ArrayType(_, _), _) => false // TODO: nested array is not supported
+      case ArrayType(MapType(_, _, _), _) => false // TODO: map array element is not supported
       case ArrayType(elementType, _) =>
         supportedDataType(elementType)
+      case MapType(MapType(_, _, _), _, _) => false // TODO: nested map is not supported
+      case MapType(_, MapType(_, _, _), _) => false
+      case MapType(StructType(_), _, _) => false // TODO: struct map key/value is not supported
+      case MapType(_, StructType(_), _) => false
+      case MapType(ArrayType(_, _), _, _) => false // TODO: array map key/value is not supported
+      case MapType(_, ArrayType(_, _), _) => false
+      case MapType(keyType, valueType, _) =>
+        supportedDataType(keyType) && supportedDataType(valueType)
       case _ =>
         false
     }

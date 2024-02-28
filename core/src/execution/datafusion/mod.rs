@@ -20,4 +20,5 @@
 mod expressions;
 mod operators;
 pub mod planner;
+pub(crate) mod shuffle_writer;
 mod spark_hash;

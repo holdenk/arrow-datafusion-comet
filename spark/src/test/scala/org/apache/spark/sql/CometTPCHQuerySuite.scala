@@ -82,11 +82,15 @@ class CometTPCHQuerySuite extends QueryTest with CometTPCBase with SQLQueryTestH
     val conf = super.sparkConf
     conf.set(SQLConf.SHUFFLE_PARTITIONS.key, "1")
     conf.set("spark.sql.extensions", "org.apache.comet.CometSparkSessionExtensions")
+    conf.set(
+      "spark.shuffle.manager",
+      "org.apache.spark.sql.comet.execution.shuffle.CometShuffleManager")
     conf.set(CometConf.COMET_ENABLED.key, "true")
     conf.set(CometConf.COMET_EXEC_ENABLED.key, "true")
     conf.set(CometConf.COMET_MEMORY_OVERHEAD.key, "2g")
     conf.set(CometConf.COMET_EXEC_ALL_OPERATOR_ENABLED.key, "true")
     conf.set(CometConf.COMET_EXEC_ALL_EXPR_ENABLED.key, "true")
+    conf.set(CometConf.COMET_EXEC_SHUFFLE_ENABLED.key, "true")
   }
 
   protected override def createSparkSession: TestSparkSession = {
@@ -169,7 +173,15 @@ class CometTPCHQuerySuite extends QueryTest with CometTPCBase with SQLQueryTestH
           (segments(1).trim, segments(2).replaceAll("\\s+$", ""))
         }
 
-        assertResult(expectedSchema, s"Schema did not match\n$queryString") {
+        // Expose thrown exception when executing the query
+        val notMatchedSchemaOutput = if (schema == emptySchema) {
+          // There might be exception. See `handleExceptions`.
+          s"Schema did not match\n$queryString\nOutput/Exception: $outputString"
+        } else {
+          s"Schema did not match\n$queryString"
+        }
+
+        assertResult(expectedSchema, notMatchedSchemaOutput) {
           schema
         }
         if (shouldSortResults) {

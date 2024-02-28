@@ -19,11 +19,16 @@
 
 package org.apache.comet.vector
 
+import java.io.OutputStream
+
+import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 import org.apache.arrow.c.{ArrowArray, ArrowImporter, ArrowSchema, CDataDictionaryProvider, Data}
 import org.apache.arrow.memory.RootAllocator
 import org.apache.arrow.vector._
+import org.apache.arrow.vector.dictionary.DictionaryProvider
+import org.apache.arrow.vector.ipc.ArrowStreamWriter
 import org.apache.spark.SparkException
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -33,17 +38,85 @@ class NativeUtil {
   private val importer = new ArrowImporter(allocator)
 
   /**
+   * Serializes a list of `ColumnarBatch` into an output stream.
+   *
+   * @param batches
+   *   the output batches, each batch is a list of Arrow vectors wrapped in `CometVector`
+   * @param out
+   *   the output stream
+   */
+  def serializeBatches(batches: Iterator[ColumnarBatch], out: OutputStream): Long = {
+    var schemaRoot: Option[VectorSchemaRoot] = None
+    var writer: Option[ArrowStreamWriter] = None
+    var rowCount = 0
+
+    batches.foreach { batch =>
+      val (fieldVectors, batchProviderOpt) = getBatchFieldVectors(batch)
+      val root = schemaRoot.getOrElse(new VectorSchemaRoot(fieldVectors.asJava))
+      val provider = batchProviderOpt.getOrElse(dictionaryProvider)
+
+      if (writer.isEmpty) {
+        writer = Some(new ArrowStreamWriter(root, provider, out))
+        writer.get.start()
+      }
+      writer.get.writeBatch()
+
+      root.clear()
+      schemaRoot = Some(root)
+
+      rowCount += batch.numRows()
+    }
+
+    writer.map(_.end())
+    schemaRoot.map(_.close())
+
+    rowCount
+  }
+
+  def getBatchFieldVectors(
+      batch: ColumnarBatch): (Seq[FieldVector], Option[DictionaryProvider]) = {
+    var provider: Option[DictionaryProvider] = None
+    val fieldVectors = (0 until batch.numCols()).map { index =>
+      batch.column(index) match {
+        case a: CometVector =>
+          val valueVector = a.getValueVector
+          if (valueVector.getField.getDictionary != null) {
+            if (provider.isEmpty) {
+              provider = Some(a.getDictionaryProvider)
+            } else {
+              if (provider.get != a.getDictionaryProvider) {
+                throw new SparkException(
+                  "Comet execution only takes Arrow Arrays with the same dictionary provider")
+              }
+            }
+          }
+
+          getFieldVector(valueVector)
+
+        case c =>
+          throw new SparkException(
+            "Comet execution only takes Arrow Arrays, but got " +
+              s"${c.getClass}")
+      }
+    }
+    (fieldVectors, provider)
+  }
+
+  /**
    * Exports a Comet `ColumnarBatch` into a list of memory addresses that can be consumed by the
    * native execution.
    *
    * @param batch
    *   the input Comet columnar batch
    * @return
-   *   a list containing pairs of memory addresses in the format of (address of Arrow array,
-   *   address of Arrow schema)
+   *   a list containing number of rows + pairs of memory addresses in the format of (address of
+   *   Arrow array, address of Arrow schema)
    */
   def exportBatch(batch: ColumnarBatch): Array[Long] = {
-    val vectors = (0 until batch.numCols()).flatMap { index =>
+    val exportedVectors = mutable.ArrayBuffer.empty[Long]
+    exportedVectors += batch.numRows()
+
+    (0 until batch.numCols()).foreach { index =>
       batch.column(index) match {
         case a: CometVector =>
           val valueVector = a.getValueVector
@@ -63,7 +136,8 @@ class NativeUtil {
             arrowArray,
             arrowSchema)
 
-          Seq((arrowArray, arrowSchema))
+          exportedVectors += arrowArray.memoryAddress()
+          exportedVectors += arrowSchema.memoryAddress()
         case c =>
           throw new SparkException(
             "Comet execution only takes Arrow Arrays, but got " +
@@ -71,9 +145,7 @@ class NativeUtil {
       }
     }
 
-    vectors.flatMap { pair =>
-      Seq(pair._1.memoryAddress(), pair._2.memoryAddress())
-    }.toArray
+    exportedVectors.toArray
   }
 
   /**

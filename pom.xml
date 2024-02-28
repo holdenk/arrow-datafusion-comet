@@ -39,8 +39,8 @@ under the License.
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     <java.version>11</java.version>
-    <maven.compiler.source>11</maven.compiler.source>
-    <maven.compiler.target>11</maven.compiler.target>
+    <maven.compiler.source>${java.version}</maven.compiler.source>
+    <maven.compiler.target>${java.version}</maven.compiler.target>
     <scala.version>2.12.17</scala.version>
     <scala.binary.version>2.12</scala.binary.version>
     <scala.plugin.version>4.7.2</scala.plugin.version>
@@ -49,12 +49,12 @@ under the License.
     <spark.version>3.4.2</spark.version>
     <spark.version.short>3.4</spark.version.short>
     <spark.maven.scope>provided</spark.maven.scope>
-    <protobuf.version>3.17.3</protobuf.version>
+    <protobuf.version>3.19.6</protobuf.version>
     <parquet.version>1.13.1</parquet.version>
     <parquet.maven.scope>provided</parquet.maven.scope>
     <arrow.version>14.0.2</arrow.version>
     <codehaus.jackson.version>1.9.13</codehaus.jackson.version>
-    <spotless.version>2.29.0</spotless.version>
+    <spotless.version>2.43.0</spotless.version>
     <jni.dir>${project.basedir}/../core/target/debug</jni.dir>
     <platform>darwin</platform>
     <arch>x86_64</arch>
@@ -64,6 +64,26 @@ under the License.
 
     <!-- Reverse default (skip installation), and then enable only for child modules -->
     <maven.deploy.skip>true</maven.deploy.skip>
+
+    <!-- For testing with JDK 17 -->
+    <extraJavaTestArgs>
+      -XX:+IgnoreUnrecognizedVMOptions
+      --add-opens=java.base/java.lang=ALL-UNNAMED
+      --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+      --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+      --add-opens=java.base/java.io=ALL-UNNAMED
+      --add-opens=java.base/java.net=ALL-UNNAMED
+      --add-opens=java.base/java.nio=ALL-UNNAMED
+      --add-opens=java.base/java.util=ALL-UNNAMED
+      --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+      --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+      --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED
+      --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+      --add-opens=java.base/sun.nio.cs=ALL-UNNAMED
+      --add-opens=java.base/sun.security.action=ALL-UNNAMED
+      --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+      -Djdk.reflect.useDirectMethodHandle=false
+    </extraJavaTestArgs>
   </properties>
 
   <dependencyManagement>
@@ -621,8 +641,10 @@ under the License.
             <reportsDirectory>${project.build.directory}/surefire-reports</reportsDirectory>
             <junitxml>.</junitxml>
             <filereports>SparkTestSuite.txt</filereports>
+            <stdout>D</stdout>
             <stderr/>
             <tagsToExclude>org.apache.comet.IntegrationTestSuite</tagsToExclude>
+            <argLine>-ea -Xmx4g -Xss4m ${extraJavaTestArgs}</argLine>
             <systemProperties>
               <!-- emit test logs to target/unit-tests.log -->
               <log4j.configurationFile>file:src/test/resources/log4j2.properties</log4j.configurationFile>
@@ -664,6 +686,7 @@ under the License.
             <systemProperties>
               <log4j.configurationFile>file:src/test/resources/log4j2.properties</log4j.configurationFile>
             </systemProperties>
+            <argLine>-ea -Xmx4g -Xss4m ${extraJavaTestArgs}</argLine>
           </configuration>
         </plugin>
         <plugin>
@@ -700,6 +723,9 @@ under the License.
               <importOrder>
                 <order>java|javax,scala,org,org.apache,com,org.apache.comet,\#,\#org.apache.comet</order>
               </importOrder>
+              <licenseHeader>
+                <file>${maven.multiModuleProjectDirectory}/dev/copyright/java-header.txt</file>
+              </licenseHeader>
             </java>
             <scala>
               <toggleOffOn />
@@ -707,6 +733,9 @@ under the License.
                 <version>3.6.1</version>
                 <file>${maven.multiModuleProjectDirectory}/scalafmt.conf</file>
               </scalafmt>
+              <licenseHeader>
+                <file>${maven.multiModuleProjectDirectory}/dev/copyright/scala-header.txt</file>
+              </licenseHeader>
             </scala>
           </configuration>
         </plugin>
@@ -718,7 +747,6 @@ under the License.
       </plugins>
     </pluginManagement>
     <plugins>
-      <!--
       <plugin>
         <groupId>org.scalastyle</groupId>
         <artifactId>scalastyle-maven-plugin</artifactId>
@@ -756,7 +784,6 @@ under the License.
           </execution>
         </executions>
       </plugin>
-      -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-source-plugin</artifactId>
@@ -800,6 +827,7 @@ under the License.
             <exclude>**/build/**</exclude>
             <exclude>**/target/**</exclude>
             <exclude>.git/**</exclude>
+            <exclude>.github/**</exclude>
             <exclude>.gitignore</exclude>
             <exclude>.gitmodules</exclude>
             <exclude>**/.idea/**</exclude>
@@ -814,6 +842,8 @@ under the License.
             <exclude>**/test/resources/**</exclude>
             <exclude>**/benchmarks/*.txt</exclude>
             <exclude>**/inspections/*.txt</exclude>
+            <exclude>tpcds-kit/**</exclude>
+            <exclude>tpcds-sf-1/**</exclude>
           </excludes>
         </configuration>
       </plugin>

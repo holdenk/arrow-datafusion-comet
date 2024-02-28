@@ -17,9 +17,7 @@
 
 //! Define JNI APIs which can be called from Java/Scala.
 
-use crate::execution::operators::{InputBatch, ScanExec};
 use arrow::{
-    array::{make_array, Array, ArrayData, ArrayRef},
     datatypes::DataType as ArrowDataType,
     ffi::{FFI_ArrowArray, FFI_ArrowSchema},
 };
@@ -32,11 +30,13 @@ use datafusion::{
     physical_plan::{display::DisplayableExecutionPlan, ExecutionPlan, SendableRecordBatchStream},
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_common::DataFusionError;
 use futures::poll;
 use jni::{
     errors::Result as JNIResult,
-    objects::{JClass, JMap, JObject, JString, ReleaseMode},
+    objects::{
+        JByteArray, JClass, JIntArray, JLongArray, JMap, JObject, JObjectArray, JPrimitiveArray,
+        JString, ReleaseMode,
+    },
     sys::{jbyteArray, jint, jlong, jlongArray},
     JNIEnv,
 };
@@ -45,20 +45,22 @@ use std::{collections::HashMap, sync::Arc, task::Poll};
 use super::{serde, utils::SparkArrowConvert};
 
 use crate::{
-    errors::{try_unwrap_or_throw, CometError},
+    errors::{try_unwrap_or_throw, CometError, CometResult},
     execution::{
         datafusion::planner::PhysicalPlanner, metrics::utils::update_comet_metric,
-        serde::to_arrow_datatype, spark_operator::Operator,
+        serde::to_arrow_datatype, shuffle::row::process_sorted_row_partition, sort::RdxSort,
+        spark_operator::Operator,
     },
     jvm_bridge::{jni_new_global_ref, JVMClasses},
 };
 use futures::stream::StreamExt;
 use jni::{
-    objects::{AutoArray, GlobalRef},
-    sys::{jbooleanArray, jobjectArray},
+    objects::GlobalRef,
+    sys::{jboolean, jdouble, jintArray, jobjectArray, jstring},
 };
 use tokio::runtime::Runtime;
 
+use crate::execution::operators::ScanExec;
 use log::info;
 
 /// Comet native execution context. Kept alive across JNI calls.
@@ -71,6 +73,8 @@ struct ExecutionContext {
     pub root_op: Option<Arc<dyn ExecutionPlan>>,
     /// The input sources for the DataFusion plan
     pub scans: Vec<ScanExec>,
+    /// The global reference of input sources for the DataFusion plan
+    pub input_sources: Vec<Arc<GlobalRef>>,
     /// The record batch stream to pull results from
     pub stream: Option<SendableRecordBatchStream>,
     /// The FFI arrays. We need to keep them alive here.
@@ -87,21 +91,25 @@ struct ExecutionContext {
     pub debug_native: bool,
 }
 
-#[no_mangle]
 /// Accept serialized query plan and return the address of the native query plan.
-pub extern "system" fn Java_org_apache_comet_Native_createPlan(
-    env: JNIEnv,
+/// # Safety
+/// This function is inheritly unsafe since it deals with raw pointers passed from JNI.
+#[no_mangle]
+pub unsafe extern "system" fn Java_org_apache_comet_Native_createPlan(
+    e: JNIEnv,
     _class: JClass,
     id: jlong,
     config_object: JObject,
+    iterators: jobjectArray,
     serialized_query: jbyteArray,
     metrics_node: JObject,
 ) -> jlong {
-    try_unwrap_or_throw(env, || {
+    try_unwrap_or_throw(&e, |mut env| {
         // Init JVM classes
-        JVMClasses::init(&env);
+        JVMClasses::init(&mut env);
 
-        let bytes = env.convert_byte_array(serialized_query)?;
+        let array = unsafe { JPrimitiveArray::from_raw(serialized_query) };
+        let bytes = env.convert_byte_array(array)?;
 
         // Deserialize query plan
         let spark_plan = serde::deserialize_op(bytes.as_slice())?;
@@ -109,13 +117,13 @@ pub extern "system" fn Java_org_apache_comet_Native_createPlan(
         // Sets up context
         let mut configs = HashMap::new();
 
-        let config_map = JMap::from_env(&env, config_object)?;
-        config_map.iter()?.for_each(|config| {
-            let key: String = env.get_string(JString::from(config.0)).unwrap().into();
-            let value: String = env.get_string(JString::from(config.1)).unwrap().into();
-
+        let config_map = JMap::from_env(&mut env, &config_object)?;
+        let mut map_iter = config_map.iter(&mut env)?;
+        while let Some((key, value)) = map_iter.next(&mut env)? {
+            let key: String = env.get_string(&JString::from(key)).unwrap().into();
+            let value: String = env.get_string(&JString::from(value)).unwrap().into();
             configs.insert(key, value);
-        });
+        }
 
         // Whether we've enabled additional debugging on the native side
         let debug_native = configs
@@ -130,6 +138,16 @@ pub extern "system" fn Java_org_apache_comet_Native_createPlan(
 
         let metrics = Arc::new(jni_new_global_ref!(env, metrics_node)?);
 
+        // Get the global references of input sources
+        let mut input_sources = vec![];
+        let iter_array = JObjectArray::from_raw(iterators);
+        let num_inputs = env.get_array_length(&iter_array)?;
+        for i in 0..num_inputs {
+            let input_source = env.get_object_array_element(&iter_array, i)?;
+            let input_source = Arc::new(jni_new_global_ref!(env, input_source)?);
+            input_sources.push(input_source);
+        }
+
         // We need to keep the session context alive. Some session state like temporary
         // dictionaries are stored in session context. If it is dropped, the temporary
         // dictionaries will be dropped as well.
@@ -140,6 +158,7 @@ pub extern "system" fn Java_org_apache_comet_Native_createPlan(
             spark_plan,
             root_op: None,
             scans: vec![],
+            input_sources,
             stream: None,
             ffi_arrays: vec![],
             conf: configs,
@@ -156,7 +175,7 @@ pub extern "system" fn Java_org_apache_comet_Native_createPlan(
 /// Parse Comet configs and configure DataFusion session context.
 fn prepare_datafusion_session_context(
     conf: &HashMap<String, String>,
-) -> Result<SessionContext, CometError> {
+) -> CometResult<SessionContext> {
     // Get the batch size from Comet JVM side
     let batch_size = conf
         .get("batch_size")
@@ -204,11 +223,10 @@ fn prepare_datafusion_session_context(
 
 /// Prepares arrow arrays for output.
 fn prepare_output(
-    output: Result<RecordBatch, DataFusionError>,
-    env: JNIEnv,
+    env: &mut JNIEnv,
+    output_batch: RecordBatch,
     exec_context: &mut ExecutionContext,
-) -> Result<jlongArray, CometError> {
-    let output_batch = output?;
+) -> CometResult<jlongArray> {
     let results = output_batch.columns();
     let num_rows = output_batch.num_rows();
 
@@ -225,7 +243,7 @@ fn prepare_output(
     let return_flag = 1;
 
     let long_array = env.new_long_array((results.len() * 2) as i32 + 2)?;
-    env.set_long_array_region(long_array, 0, &[return_flag, num_rows as jlong])?;
+    env.set_long_array_region(&long_array, 0, &[return_flag, num_rows as jlong])?;
 
     let mut arrays = vec![];
 
@@ -240,84 +258,47 @@ fn prepare_output(
             arrays.push((arrow_array, arrow_schema));
         }
 
-        env.set_long_array_region(long_array, (i * 2) as i32 + 2, &[array, schema])?;
+        env.set_long_array_region(&long_array, (i * 2) as i32 + 2, &[array, schema])?;
         i += 1;
     }
 
     // Update metrics
-    update_metrics(&env, exec_context)?;
+    update_metrics(env, exec_context)?;
 
     // Record the pointer to allocated Arrow Arrays
     exec_context.ffi_arrays = arrays;
 
-    Ok(long_array)
+    Ok(long_array.into_raw())
 }
 
-#[no_mangle]
+/// Pull the next input from JVM. Note that we cannot pull input batches in
+/// `ScanStream.poll_next` when the execution stream is polled for output.
+/// Because the input source could be another native execution stream, which
+/// will be executed in another tokio blocking thread. It causes JNI throw
+/// Java exception. So we pull input batches here and insert them into scan
+/// operators before polling the stream,
+#[inline]
+fn pull_input_batches(exec_context: &mut ExecutionContext) -> Result<(), CometError> {
+    exec_context.scans.iter_mut().try_for_each(|scan| {
+        scan.get_next_batch()?;
+        Ok::<(), CometError>(())
+    })
+}
+
 /// Accept serialized query plan and the addresses of Arrow Arrays from Spark,
 /// then execute the query. Return addresses of arrow vector.
-pub extern "system" fn Java_org_apache_comet_Native_executePlan(
-    env: JNIEnv,
+/// # Safety
+/// This function is inheritly unsafe since it deals with raw pointers passed from JNI.
+#[no_mangle]
+pub unsafe extern "system" fn Java_org_apache_comet_Native_executePlan(
+    e: JNIEnv,
     _class: JClass,
     exec_context: jlong,
-    addresses_array: jobjectArray,
-    finishes: jbooleanArray,
-    batch_rows: jint,
 ) -> jlongArray {
-    try_unwrap_or_throw(env, || {
-        let addresses_vec = convert_addresses_arrays(&env, addresses_array)?;
-        let mut all_inputs: Vec<Vec<ArrayRef>> = Vec::with_capacity(addresses_vec.len());
-
-        let exec_context = get_execution_context(exec_context);
-        for addresses in addresses_vec.iter() {
-            let mut inputs: Vec<ArrayRef> = vec![];
-
-            let array_num = addresses.size()? as usize;
-            assert_eq!(array_num % 2, 0, "Arrow Array addresses are invalid!");
-
-            let num_arrays = array_num / 2;
-            let array_elements = addresses.as_ptr();
-
-            let mut i: usize = 0;
-            while i < num_arrays {
-                let array_ptr = unsafe { *(array_elements.add(i * 2)) };
-                let schema_ptr = unsafe { *(array_elements.add(i * 2 + 1)) };
-                let array_data = ArrayData::from_spark((array_ptr, schema_ptr))?;
-
-                if exec_context.debug_native {
-                    // Validate the array data from JVM.
-                    array_data.validate_full().expect("Invalid array data");
-                }
-
-                inputs.push(make_array(array_data));
-                i += 1;
-            }
-
-            all_inputs.push(inputs);
-        }
-
-        // Prepares the input batches.
-        let eofs = env.get_boolean_array_elements(finishes, ReleaseMode::NoCopyBack)?;
-        let eof_flags = eofs.as_ptr();
-
-        // Whether reaching the end of input batches.
-        let mut finished = true;
-        let mut input_batches = all_inputs
-            .into_iter()
-            .enumerate()
-            .map(|(idx, inputs)| unsafe {
-                let eof = eof_flags.add(idx);
-
-                if *eof == 1 {
-                    InputBatch::EOF
-                } else {
-                    finished = false;
-                    InputBatch::new(inputs, Some(batch_rows as usize))
-                }
-            })
-            .collect::<Vec<InputBatch>>();
-
+    try_unwrap_or_throw(&e, |mut env| {
         // Retrieve the query
+        let exec_context = get_execution_context(exec_context);
+
         let exec_context_id = exec_context.id;
 
         // Initialize the execution stream.
@@ -325,8 +306,10 @@ pub extern "system" fn Java_org_apache_comet_Native_executePlan(
         // query plan, we need to defer stream initialization to first time execution.
         if exec_context.root_op.is_none() {
             let planner = PhysicalPlanner::new().with_exec_id(exec_context_id);
-            let (scans, root_op) =
-                planner.create_plan(&exec_context.spark_plan, &mut input_batches)?;
+            let (scans, root_op) = planner.create_plan(
+                &exec_context.spark_plan,
+                &mut exec_context.input_sources.clone(),
+            )?;
 
             exec_context.root_op = Some(root_op.clone());
             exec_context.scans = scans;
@@ -345,15 +328,8 @@ pub extern "system" fn Java_org_apache_comet_Native_executePlan(
                 .execute(0, task_ctx)?;
             exec_context.stream = Some(stream);
         } else {
-            input_batches
-                .into_iter()
-                .enumerate()
-                .for_each(|(idx, input_batch)| {
-                    let scan = &mut exec_context.scans[idx];
-
-                    // Set inputs at `Scan` node.
-                    scan.set_input_batch(input_batch);
-                });
+            // Pull input batches
+            pull_input_batches(exec_context)?;
         }
 
         loop {
@@ -363,35 +339,30 @@ pub extern "system" fn Java_org_apache_comet_Native_executePlan(
 
             match poll_output {
                 Poll::Ready(Some(output)) => {
-                    return prepare_output(output, env, exec_context);
+                    return prepare_output(&mut env, output?, exec_context);
                 }
                 Poll::Ready(None) => {
                     // Reaches EOF of output.
 
                     // Update metrics
-                    update_metrics(&env, exec_context)?;
+                    update_metrics(&mut env, exec_context)?;
 
                     let long_array = env.new_long_array(1)?;
-                    env.set_long_array_region(long_array, 0, &[-1])?;
+                    env.set_long_array_region(&long_array, 0, &[-1])?;
 
-                    return Ok(long_array);
+                    return Ok(long_array.into_raw());
                 }
-                // After reaching the end of any input, a poll pending means there are more than one
-                // blocking operators, we don't need go back-forth between JVM/Native. Just
-                // keeping polling.
-                Poll::Pending if finished => {
+                // A poll pending means there are more than one blocking operators,
+                // we don't need go back-forth between JVM/Native. Just keeping polling.
+                Poll::Pending => {
                     // Update metrics
-                    update_metrics(&env, exec_context)?;
+                    update_metrics(&mut env, exec_context)?;
+
+                    // Pull input batches
+                    pull_input_batches(exec_context)?;
 
                     // Output not ready yet
                     continue;
-                }
-                // Not reaching the end of input yet, so a poll pending means there are blocking
-                // operators. Just returning to keep reading next input.
-                Poll::Pending => {
-                    // Update metrics
-                    update_metrics(&env, exec_context)?;
-                    return return_pending(env);
                 }
             }
         }
@@ -400,50 +371,18 @@ pub extern "system" fn Java_org_apache_comet_Native_executePlan(
 
 fn return_pending(env: JNIEnv) -> Result<jlongArray, CometError> {
     let long_array = env.new_long_array(1)?;
-    env.set_long_array_region(long_array, 0, &[0])?;
-
-    Ok(long_array)
-}
-
-#[no_mangle]
-/// Peeks into next output if any.
-pub extern "system" fn Java_org_apache_comet_Native_peekNext(
-    env: JNIEnv,
-    _class: JClass,
-    exec_context: jlong,
-) -> jlongArray {
-    try_unwrap_or_throw(env, || {
-        // Retrieve the query
-        let exec_context = get_execution_context(exec_context);
-
-        if exec_context.stream.is_none() {
-            // Plan is not initialized yet.
-            return return_pending(env);
-        }
-
-        // Polling the stream.
-        let next_item = exec_context.stream.as_mut().unwrap().next();
-        let poll_output = exec_context.runtime.block_on(async { poll!(next_item) });
-
-        match poll_output {
-            Poll::Ready(Some(output)) => prepare_output(output, env, exec_context),
-            _ => {
-                // Update metrics
-                update_metrics(&env, exec_context)?;
-                return_pending(env)
-            }
-        }
-    })
+    env.set_long_array_region(&long_array, 0, &[0])?;
+    Ok(long_array.into_raw())
 }
 
 #[no_mangle]
 /// Drop the native query plan object and context object.
 pub extern "system" fn Java_org_apache_comet_Native_releasePlan(
-    env: JNIEnv,
+    e: JNIEnv,
     _class: JClass,
     exec_context: jlong,
 ) {
-    try_unwrap_or_throw(env, || unsafe {
+    try_unwrap_or_throw(&e, |_| unsafe {
         let execution_context = get_execution_context(exec_context);
         let _: Box<ExecutionContext> = Box::from_raw(execution_context);
         Ok(())
@@ -451,51 +390,32 @@ pub extern "system" fn Java_org_apache_comet_Native_releasePlan(
 }
 
 /// Updates the metrics of the query plan.
-fn update_metrics(env: &JNIEnv, exec_context: &ExecutionContext) -> Result<(), CometError> {
+fn update_metrics(env: &mut JNIEnv, exec_context: &ExecutionContext) -> CometResult<()> {
     let native_query = exec_context.root_op.as_ref().unwrap();
     let metrics = exec_context.metrics.as_obj();
     update_comet_metric(env, metrics, native_query)
 }
 
-/// Converts a Java array of address arrays to a Rust vector of address arrays.
-fn convert_addresses_arrays<'a>(
-    env: &'a JNIEnv<'a>,
-    addresses_array: jobjectArray,
-) -> JNIResult<Vec<AutoArray<'a, 'a, jlong>>> {
-    let array_len = env.get_array_length(addresses_array)?;
-    let mut res: Vec<AutoArray<jlong>> = Vec::new();
-
-    for i in 0..array_len {
-        let array: AutoArray<jlong> = env.get_array_elements(
-            env.get_object_array_element(addresses_array, i)?
-                .into_inner() as jlongArray,
-            ReleaseMode::NoCopyBack,
-        )?;
-        res.push(array);
-    }
-
-    Ok(res)
-}
-
 fn convert_datatype_arrays(
-    env: &'_ JNIEnv<'_>,
+    env: &'_ mut JNIEnv<'_>,
     serialized_datatypes: jobjectArray,
 ) -> JNIResult<Vec<ArrowDataType>> {
-    let array_len = env.get_array_length(serialized_datatypes)?;
-    let mut res: Vec<ArrowDataType> = Vec::new();
+    unsafe {
+        let obj_array = JObjectArray::from_raw(serialized_datatypes);
+        let array_len = env.get_array_length(&obj_array)?;
+        let mut res: Vec<ArrowDataType> = Vec::new();
 
-    for i in 0..array_len {
-        let array = env
-            .get_object_array_element(serialized_datatypes, i)?
-            .into_inner() as jbyteArray;
+        for i in 0..array_len {
+            let inner_array = env.get_object_array_element(&obj_array, i)?;
+            let inner_array: JByteArray = inner_array.into();
+            let bytes = env.convert_byte_array(inner_array)?;
+            let data_type = serde::deserialize_data_type(bytes.as_slice()).unwrap();
+            let arrow_dt = to_arrow_datatype(&data_type);
+            res.push(arrow_dt);
+        }
 
-        let bytes = env.convert_byte_array(array)?;
-        let data_type = serde::deserialize_data_type(bytes.as_slice()).unwrap();
-        let arrow_dt = to_arrow_datatype(&data_type);
-        res.push(arrow_dt);
+        Ok(res)
     }
-
-    Ok(res)
 }
 
 fn get_execution_context<'a>(id: i64) -> &'a mut ExecutionContext {
@@ -504,4 +424,92 @@ fn get_execution_context<'a>(id: i64) -> &'a mut ExecutionContext {
             .as_mut()
             .expect("Comet execution context shouldn't be null!")
     }
+}
+
+/// Used by Comet shuffle external sorter to write sorted records to disk.
+/// # Safety
+/// This function is inheritly unsafe since it deals with raw pointers passed from JNI.
+#[no_mangle]
+pub unsafe extern "system" fn Java_org_apache_comet_Native_writeSortedFileNative(
+    e: JNIEnv,
+    _class: JClass,
+    row_addresses: jlongArray,
+    row_sizes: jintArray,
+    serialized_datatypes: jobjectArray,
+    file_path: jstring,
+    prefer_dictionary_ratio: jdouble,
+    batch_size: jlong,
+    checksum_enabled: jboolean,
+    checksum_algo: jint,
+    current_checksum: jlong,
+) -> jlongArray {
+    try_unwrap_or_throw(&e, |mut env| unsafe {
+        let data_types = convert_datatype_arrays(&mut env, serialized_datatypes)?;
+
+        let row_address_array = JLongArray::from_raw(row_addresses);
+        let row_num = env.get_array_length(&row_address_array)? as usize;
+        let row_addresses = env.get_array_elements(&row_address_array, ReleaseMode::NoCopyBack)?;
+
+        let row_size_array = JIntArray::from_raw(row_sizes);
+        let row_sizes = env.get_array_elements(&row_size_array, ReleaseMode::NoCopyBack)?;
+
+        let row_addresses_ptr = row_addresses.as_ptr();
+        let row_sizes_ptr = row_sizes.as_ptr();
+
+        let output_path: String = env
+            .get_string(&JString::from_raw(file_path))
+            .unwrap()
+            .into();
+
+        let checksum_enabled = checksum_enabled == 1;
+        let current_checksum = if current_checksum == i64::MIN {
+            // Initial checksum is not available.
+            None
+        } else {
+            Some(current_checksum as u32)
+        };
+
+        let (written_bytes, checksum) = process_sorted_row_partition(
+            row_num,
+            batch_size as usize,
+            row_addresses_ptr,
+            row_sizes_ptr,
+            &data_types,
+            output_path,
+            prefer_dictionary_ratio,
+            checksum_enabled,
+            checksum_algo,
+            current_checksum,
+        )?;
+
+        let checksum = if let Some(checksum) = checksum {
+            checksum as i64
+        } else {
+            // Spark checksums (CRC32 or Adler32) are both u32, so we use i64::MIN to indicate
+            // checksum is not available.
+            i64::MIN
+        };
+
+        let long_array = env.new_long_array(2)?;
+        env.set_long_array_region(&long_array, 0, &[written_bytes, checksum])?;
+
+        Ok(long_array.into_raw())
+    })
+}
+
+#[no_mangle]
+/// Used by Comet shuffle external sorter to sort in-memory row partition ids.
+pub extern "system" fn Java_org_apache_comet_Native_sortRowPartitionsNative(
+    e: JNIEnv,
+    _class: JClass,
+    address: jlong,
+    size: jlong,
+) {
+    try_unwrap_or_throw(&e, |_| {
+        // SAFETY: JVM unsafe memory allocation is aligned with long.
+        let array = unsafe { std::slice::from_raw_parts_mut(address as *mut i64, size as usize) };
+        array.rdxsort();
+
+        Ok(())
+    })
 }

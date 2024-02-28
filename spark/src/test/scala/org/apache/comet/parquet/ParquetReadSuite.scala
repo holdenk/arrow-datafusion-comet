@@ -42,15 +42,14 @@ import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.comet.CometBatchScanExec
 import org.apache.spark.sql.comet.CometScanExec
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
-import org.apache.spark.sql.execution.datasources.SchemaColumnConvertNotSupportedException
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
+import com.google.common.primitives.UnsignedLong
+
 import org.apache.comet.CometConf
 import org.apache.comet.CometSparkSessionExtensions.isSpark34Plus
-
-import com.google.common.primitives.UnsignedLong
 
 abstract class ParquetReadSuite extends CometTestBase {
   import testImplicits._
@@ -1139,7 +1138,7 @@ abstract class ParquetReadSuite extends CometTestBase {
           .where(s"a < ${Long.MaxValue}")
           .collect()
       }
-      assert(exception.getCause.getCause.isInstanceOf[SchemaColumnConvertNotSupportedException])
+      assert(exception.getMessage.contains("Column: [a], Expected: bigint, Found: INT32"))
     }
   }
 

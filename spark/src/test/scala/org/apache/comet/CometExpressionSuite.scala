@@ -286,6 +286,23 @@ class CometExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     }
   }
 
+  test("trunc with format array") {
+    val numRows = 1000
+    Seq(true, false).foreach { dictionaryEnabled =>
+      withTempDir { dir =>
+        val path = new Path(dir.toURI.toString, "date_trunc_with_format.parquet")
+        makeDateTimeWithFormatTable(path, dictionaryEnabled = dictionaryEnabled, numRows)
+        withParquetTable(path.toString, "dateformattbl") {
+          checkSparkAnswerAndOperator(
+            "SELECT " +
+              "dateformat, _7, " +
+              "trunc(_7, dateformat) " +
+              " from dateformattbl ")
+        }
+      }
+    }
+  }
+
   test("date_trunc") {
     Seq(true, false).foreach { dictionaryEnabled =>
       withTempDir { dir =>
@@ -350,6 +367,28 @@ class CometExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelper {
                 s"date_trunc('$format', _5)  " +
                 " from timetbl")
           }
+        }
+      }
+    }
+  }
+
+  test("date_trunc with format array") {
+    val numRows = 1000
+    Seq(true, false).foreach { dictionaryEnabled =>
+      withTempDir { dir =>
+        val path = new Path(dir.toURI.toString, "timestamp_trunc_with_format.parquet")
+        makeDateTimeWithFormatTable(path, dictionaryEnabled = dictionaryEnabled, numRows)
+        withParquetTable(path.toString, "timeformattbl") {
+          checkSparkAnswerAndOperator(
+            "SELECT " +
+              "format, _0, _1, _2, _3, _4, _5, " +
+              "date_trunc(format, _0), " +
+              "date_trunc(format, _1), " +
+              "date_trunc(format, _2), " +
+              "date_trunc(format, _3), " +
+              "date_trunc(format, _4), " +
+              "date_trunc(format, _5) " +
+              " from timeformattbl ")
         }
       }
     }
@@ -996,23 +1035,27 @@ class CometExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     }
   }
 
-  test("test in/not in") {
-    Seq(false, true).foreach { dictionary =>
-      withSQLConf("parquet.enable.dictionary" -> dictionary.toString) {
-        val table = "names"
-        withTable(table) {
-          sql(s"create table $table(id int, name varchar(20)) using parquet")
-          sql(
-            s"insert into $table values(1, 'James'), (1, 'Jones'), (2, 'Smith'), (3, 'Smith')," +
-              "(NULL, 'Jones'), (4, NULL)")
+  test("test in(set)/not in(set)") {
+    Seq("100", "0").foreach { inSetThreshold =>
+      Seq(false, true).foreach { dictionary =>
+        withSQLConf(
+          SQLConf.OPTIMIZER_INSET_CONVERSION_THRESHOLD.key -> inSetThreshold,
+          "parquet.enable.dictionary" -> dictionary.toString) {
+          val table = "names"
+          withTable(table) {
+            sql(s"create table $table(id int, name varchar(20)) using parquet")
+            sql(
+              s"insert into $table values(1, 'James'), (1, 'Jones'), (2, 'Smith'), (3, 'Smith')," +
+                "(NULL, 'Jones'), (4, NULL)")
 
-          checkSparkAnswerAndOperator(s"SELECT * FROM $table WHERE id in (1, 2, 4, NULL)")
-          checkSparkAnswerAndOperator(
-            s"SELECT * FROM $table WHERE name in ('Smith', 'Brown', NULL)")
+            checkSparkAnswerAndOperator(s"SELECT * FROM $table WHERE id in (1, 2, 4, NULL)")
+            checkSparkAnswerAndOperator(
+              s"SELECT * FROM $table WHERE name in ('Smith', 'Brown', NULL)")
 
-          // TODO: why with not in, the plan is only `LocalTableScan`?
-          checkSparkAnswer(s"SELECT * FROM $table WHERE id not in (1)")
-          checkSparkAnswer(s"SELECT * FROM $table WHERE name not in ('Smith', 'Brown', NULL)")
+            // TODO: why with not in, the plan is only `LocalTableScan`?
+            checkSparkAnswer(s"SELECT * FROM $table WHERE id not in (1)")
+            checkSparkAnswer(s"SELECT * FROM $table WHERE name not in ('Smith', 'Brown', NULL)")
+          }
         }
       }
     }
@@ -1259,4 +1302,28 @@ class CometExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelper {
       }
     }
   }
+
+  test("test cast utf8 to boolean as compatible with Spark") {
+    def testCastedColumn(inputValues: Seq[String]): Unit = {
+      val table = "test_table"
+      withTable(table) {
+        val values = inputValues.map(x => s"('$x')").mkString(",")
+        sql(s"create table $table(base_column char(20)) using parquet")
+        sql(s"insert into $table values $values")
+        checkSparkAnswerAndOperator(
+          s"select base_column, cast(base_column as boolean) as casted_column from $table")
+      }
+    }
+
+    // Supported boolean values as true by both Arrow and Spark
+    testCastedColumn(inputValues = Seq("t", "true", "y", "yes", "1", "T", "TrUe", "Y", "YES"))
+    // Supported boolean values as false by both Arrow and Spark
+    testCastedColumn(inputValues = Seq("f", "false", "n", "no", "0", "F", "FaLSe", "N", "No"))
+    // Supported boolean values by Arrow but not Spark
+    testCastedColumn(inputValues =
+      Seq("TR", "FA", "tr", "tru", "ye", "on", "fa", "fal", "fals", "of", "off"))
+    // Invalid boolean casting values for Arrow and Spark
+    testCastedColumn(inputValues = Seq("car", "Truck"))
+  }
+
 }

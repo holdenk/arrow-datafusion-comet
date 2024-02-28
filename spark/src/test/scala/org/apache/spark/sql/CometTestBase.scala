@@ -35,7 +35,8 @@ import org.apache.parquet.hadoop.ParquetWriter
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.schema.{MessageType, MessageTypeParser}
 import org.apache.spark._
-import org.apache.spark.sql.comet.{CometBatchScanExec, CometExec, CometScanExec, CometScanWrapper, CometSinkPlaceHolder}
+import org.apache.spark.sql.comet.{CometBatchScanExec, CometBroadcastExchangeExec, CometExec, CometScanExec, CometScanWrapper, CometSinkPlaceHolder}
+import org.apache.spark.sql.comet.execution.shuffle.{CometColumnarShuffle, CometNativeShuffle, CometShuffleExchangeExec}
 import org.apache.spark.sql.execution.{ColumnarToRowExec, InputAdapter, SparkPlan, WholeStageCodegenExec}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.internal._
@@ -57,10 +58,14 @@ abstract class CometTestBase
     with AdaptiveSparkPlanHelper {
   import testImplicits._
 
+  protected val shuffleManager: String =
+    "org.apache.spark.sql.comet.execution.shuffle.CometShuffleManager"
+
   protected def sparkConf: SparkConf = {
     val conf = new SparkConf()
     conf.set("spark.hadoop.fs.file.impl", classOf[DebugFilesystem].getName)
     conf.set(SQLConf.SHUFFLE_PARTITIONS, 10) // reduce parallelism in tests
+    conf.set("spark.shuffle.manager", shuffleManager)
     conf.set(CometConf.COMET_MEMORY_OVERHEAD.key, "2g")
     conf
   }
@@ -73,6 +78,9 @@ abstract class CometTestBase
         CometConf.COMET_EXEC_ENABLED.key -> "true",
         CometConf.COMET_EXEC_ALL_OPERATOR_ENABLED.key -> "true",
         CometConf.COMET_EXEC_ALL_EXPR_ENABLED.key -> "true",
+        CometConf.COMET_COLUMNAR_SHUFFLE_MEMORY_SIZE.key -> "2g",
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "1g",
+        SQLConf.ADAPTIVE_AUTO_BROADCASTJOIN_THRESHOLD.key -> "1g",
         SQLConf.ANSI_ENABLED.key -> "false") {
         testFun
       }
@@ -150,7 +158,8 @@ abstract class CometTestBase
     plan.foreach {
       case _: CometScanExec | _: CometBatchScanExec => true
       case _: CometSinkPlaceHolder | _: CometScanWrapper => false
-      case _: CometExec => true
+      case _: CometExec | _: CometShuffleExchangeExec => true
+      case _: CometBroadcastExchangeExec => true
       case _: WholeStageCodegenExec | _: ColumnarToRowExec | _: InputAdapter => true
       case op =>
         if (excludedClasses.exists(c => c.isAssignableFrom(op.getClass))) {
@@ -580,6 +589,81 @@ abstract class CometTestBase
     expected
   }
 
+  protected def makeDateTimeWithFormatTable(
+      path: Path,
+      dictionaryEnabled: Boolean,
+      n: Int,
+      rowGroupSize: Long = 1024 * 1024L): Seq[Option[Long]] = {
+    val schemaStr =
+      """
+        |message root {
+        |  optional int64 _0(TIMESTAMP_MILLIS);
+        |  optional int64 _1(TIMESTAMP_MICROS);
+        |  optional int64 _2(TIMESTAMP(MILLIS,true));
+        |  optional int64 _3(TIMESTAMP(MILLIS,false));
+        |  optional int64 _4(TIMESTAMP(MICROS,true));
+        |  optional int64 _5(TIMESTAMP(MICROS,false));
+        |  optional int64 _6(INT_64);
+        |  optional int32 _7(DATE);
+        |  optional binary format(UTF8);
+        |  optional binary dateFormat(UTF8);
+        |  }
+      """.stripMargin
+
+    val schema = MessageTypeParser.parseMessageType(schemaStr)
+    val writer = createParquetWriter(
+      schema,
+      path,
+      dictionaryEnabled = dictionaryEnabled,
+      rowGroupSize = rowGroupSize)
+    val div = if (dictionaryEnabled) 10 else n // maps value to a small range for dict to kick in
+
+    val expected = (0 until n).map { i =>
+      Some(getValue(i, div))
+    }
+    expected.foreach { opt =>
+      val timestampFormats = List(
+        "YEAR",
+        "YYYY",
+        "YY",
+        "MON",
+        "MONTH",
+        "MM",
+        "QUARTER",
+        "WEEK",
+        "DAY",
+        "DD",
+        "HOUR",
+        "MINUTE",
+        "SECOND",
+        "MILLISECOND",
+        "MICROSECOND")
+      val dateFormats = List("YEAR", "YYYY", "YY", "MON", "MONTH", "MM", "QUARTER", "WEEK")
+      val formats = timestampFormats.zipAll(dateFormats, "NONE", "YEAR")
+
+      formats.foreach { format =>
+        val record = new SimpleGroup(schema)
+        opt match {
+          case Some(i) =>
+            record.add(0, i)
+            record.add(1, i * 1000) // convert millis to micros, same below
+            record.add(2, i)
+            record.add(3, i)
+            record.add(4, i * 1000)
+            record.add(5, i * 1000)
+            record.add(6, i * 1000)
+            record.add(7, i.toInt)
+            record.add(8, format._1)
+            record.add(9, format._2)
+          case _ =>
+        }
+        writer.write(record)
+      }
+    }
+    writer.close()
+    expected
+  }
+
   def makeDecimalRDD(num: Int, decimal: DecimalType, useDictionary: Boolean): DataFrame = {
     val div = if (useDictionary) 5 else num // narrow the space to make it dictionary encoded
     spark
@@ -593,5 +677,34 @@ abstract class CometTestBase
 
   def stripRandomPlanParts(plan: String): String = {
     plan.replaceFirst("file:.*,", "").replaceAll(raw"#\d+", "")
+  }
+
+  protected def checkCometExchange(
+      df: DataFrame,
+      cometExchangeNum: Int,
+      native: Boolean): Seq[CometShuffleExchangeExec] = {
+    if (CometConf.COMET_EXEC_SHUFFLE_ENABLED.get()) {
+      val sparkPlan = stripAQEPlan(df.queryExecution.executedPlan)
+
+      val cometShuffleExecs = sparkPlan.collect { case b: CometShuffleExchangeExec => b }
+      assert(
+        cometShuffleExecs.length == cometExchangeNum,
+        s"$sparkPlan has ${cometShuffleExecs.length} " +
+          s" CometShuffleExchangeExec node which doesn't match the expected: $cometExchangeNum")
+
+      if (native) {
+        cometShuffleExecs.foreach { b =>
+          assert(b.shuffleType == CometNativeShuffle)
+        }
+      } else {
+        cometShuffleExecs.foreach { b =>
+          assert(b.shuffleType == CometColumnarShuffle)
+        }
+      }
+
+      cometShuffleExecs
+    } else {
+      Seq.empty
+    }
   }
 }

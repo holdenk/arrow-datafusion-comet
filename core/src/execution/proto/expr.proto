@@ -85,6 +85,8 @@ message AggExpr {
     Min min = 4;
     Max max = 5;
     Avg avg = 6;
+    First first = 7;
+    Last last = 8;
   }
 }
 
@@ -113,6 +115,18 @@ message Avg {
   DataType datatype = 2;
   DataType sum_datatype = 3;
   bool fail_on_error = 4; // currently unused (useful for deciding Ansi vs Legacy mode)
+}
+
+message First {
+  Expr child = 1;
+  DataType datatype = 2;
+  bool ignore_nulls = 3;
+}
+
+message Last {
+  Expr child = 1;
+  DataType datatype = 2;
+  bool ignore_nulls = 3;
 }
 
 message Literal {
@@ -421,7 +435,8 @@ message DataType {
     DATE = 12;
     NULL = 13;
     LIST = 14;
-    STRUCT = 15;
+    MAP = 15;
+    STRUCT = 16;
   }
   DataTypeId type_id = 1;
 
@@ -429,7 +444,8 @@ message DataType {
     oneof datatype_struct {
       DecimalInfo decimal = 2;
       ListInfo list = 3;
-      StructInfo struct = 4;
+      MapInfo map = 4;
+      StructInfo struct = 5;
     }
   }
 
@@ -441,6 +457,12 @@ message DataType {
   message ListInfo {
     DataType element_type = 1;
     bool contains_null = 2;
+  }
+
+  message MapInfo {
+    DataType key_type = 1;
+    DataType value_type = 2;
+    bool value_contains_null = 3;
   }
 
   message StructInfo {
